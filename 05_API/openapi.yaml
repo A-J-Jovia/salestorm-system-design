@@ -1,0 +1,403 @@
+openapi: 3.0.3
+info:
+  title: SALESTORM High-Scale Flash-Sale API
+  description: >
+    Production-grade OpenAPI 3.0 specification for the SALESTORM flash-sale engine.
+    Designed to sustain 10,000 concurrent requests contending for 100 stock units
+    with strict idempotency, sub-second latency, and zero overselling guarantees.
+  version: 1.0.0
+  contact:
+    name: SALESTORM Architecture Team
+    email: architecture@salestorm.io
+
+servers:
+  - url: https://api.salestorm.io
+    description: Production Edge Gateway (Cloudflare + Kong API Gateway)
+  - url: http://localhost:8000
+    description: Local Development / Test Cluster
+
+tags:
+  - name: Inventory
+    description: Stock reservation gatekeeper running atomic Redis Lua scripts.
+  - name: Payments
+    description: Idempotent payment processing with Transactional Outbox integration.
+  - name: Orders
+    description: Strong-consistency order lifecycle query and tracking.
+
+paths:
+  /api/v1/inventory/reserve:
+    post:
+      tags:
+        - Inventory
+      summary: Atomically reserve stock for flash-sale item
+      description: >
+        Invokes an atomic Redis Lua evaluation to check inventory and allocate a
+        soft reservation lease with a 300-second TTL. Rejects requests with HTTP 409
+        when inventory reaches zero without querying the primary database.
+      operationId: reserveStock
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Idempotency-Key
+          in: header
+          required: true
+          description: Client-generated UUIDv4 preventing duplicate reservations.
+          schema:
+            type: string
+            format: uuid
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReservationRequest'
+      responses:
+        '201':
+          description: Stock successfully reserved under a temporary lease.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationResponse'
+        '400':
+          description: Malformed request payload or invalid parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid authentication token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Item is completely out of stock (zero inventory available).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "OUT_OF_STOCK"
+                message: "Flash sale item is sold out. Zero available inventory."
+                timestamp: "2026-10-05T12:00:00Z"
+        '429':
+          description: "Rate limit exceeded (Threshold: max 5 requests/sec per IP)."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "RATE_LIMIT_EXCEEDED"
+                message: "Too many requests. Burst limit exceeded."
+                timestamp: "2026-10-05T12:00:00Z"
+        '500':
+          description: Internal server or cache communication error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/payments/charge:
+    post:
+      tags:
+        - Payments
+      summary: Process payment and trigger Transactional Outbox
+      description: >
+        Captures payment for an active reservation using an upstream payment gateway.
+        Guarantees strict idempotency via Redis locks and replays cached transaction
+        data on client retries. Atomically commits payment state and outbox events
+        inside a single ACID database transaction.
+      operationId: processPayment
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Idempotency-Key
+          in: header
+          required: true
+          description: Unique transaction idempotency key preventing double charging.
+          schema:
+            type: string
+            format: uuid
+            example: "e2c34a98-10b2-4d22-8df2-0691e84df9fa"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+      responses:
+        '200':
+          description: Payment confirmed and captured successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '400':
+          description: Invalid payload, payment declined, or reservation lease expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "RESERVATION_EXPIRED"
+                message: "Reservation lease has expired. Stock was returned to pool."
+                timestamp: "2026-10-05T12:00:00Z"
+        '401':
+          description: Missing or invalid authentication token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Concurrent request in flight for this idempotency key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "PAYMENT_IN_PROGRESS"
+                message: "A payment request with this idempotency key is currently processing."
+                timestamp: "2026-10-05T12:00:00Z"
+        '500':
+          description: Upstream gateway failure or database commit error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/orders/{order_id}:
+    get:
+      tags:
+        - Orders
+      summary: Retrieve order state and full fulfillment lifecycle
+      description: >
+        Returns the persistent state of an order from the primary relational database.
+        Allows real-time lifecycle tracking across the Saga orchestration stages.
+      operationId: getOrderById
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          description: Canonical unique identifier of the order.
+          schema:
+            type: string
+            example: "ord_8829f041b3a1"
+      responses:
+        '200':
+          description: Order details and current lifecycle state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailsResponse'
+        '401':
+          description: Missing or invalid authentication token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Order ID not found in database.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: "ORDER_NOT_FOUND"
+                message: "The requested order identifier does not exist."
+                timestamp: "2026-10-05T12:00:00Z"
+        '500':
+          description: Internal database query failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JSON Web Token issued by the Identity Service.
+
+  schemas:
+    ReservationRequest:
+      type: object
+      required:
+        - item_id
+        - user_id
+        - quantity
+      properties:
+        item_id:
+          type: string
+          description: Unique SKU identifier for the flash-sale product.
+          example: "item_flash_mbp_2026"
+        user_id:
+          type: string
+          description: Unique buyer account identifier.
+          example: "usr_99182a4c"
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 2
+          default: 1
+          description: Units requested (strictly capped per user during flash-sales).
+          example: 1
+
+    ReservationResponse:
+      type: object
+      required:
+        - reservation_id
+        - item_id
+        - reserved_quantity
+        - status
+        - ttl_seconds
+      properties:
+        reservation_id:
+          type: string
+          description: Ephemeral reservation token mapped in Redis.
+          example: "res_98fbc12a441e"
+        item_id:
+          type: string
+          example: "item_flash_mbp_2026"
+        reserved_quantity:
+          type: integer
+          example: 1
+        status:
+          type: string
+          enum: [RESERVED, ALREADY_RESERVED]
+          example: "RESERVED"
+        ttl_seconds:
+          type: integer
+          description: Remaining time before unconfirmed stock returns to the pool.
+          example: 300
+
+    PaymentRequest:
+      type: object
+      required:
+        - reservation_id
+        - user_id
+        - amount_cents
+        - currency
+      properties:
+        reservation_id:
+          type: string
+          description: Active reservation identifier generated in the reservation phase.
+          example: "res_98fbc12a441e"
+        user_id:
+          type: string
+          example: "usr_99182a4c"
+        amount_cents:
+          type: integer
+          description: Amount to charge formatted in smallest currency unit (e.g., cents).
+          minimum: 1
+          example: 199900
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          default: "USD"
+          example: "USD"
+
+    PaymentResponse:
+      type: object
+      required:
+        - payment_id
+        - idempotency_key
+        - status
+        - gateway_transaction_id
+        - cached_response
+      properties:
+        payment_id:
+          type: string
+          description: Internal unique payment reference identifier.
+          example: "pay_66f60f4c86c0"
+        idempotency_key:
+          type: string
+          format: uuid
+          example: "e2c34a98-10b2-4d22-8df2-0691e84df9fa"
+        status:
+          type: string
+          enum: [SUCCESS, FAILED]
+          example: "SUCCESS"
+        gateway_transaction_id:
+          type: string
+          description: Upstream capture identifier from payment processor.
+          example: "ch_3PzQx9LkdI"
+        cached_response:
+          type: boolean
+          description: True if response was replayed from cache without re-charging.
+          example: false
+
+    OrderDetailsResponse:
+      type: object
+      required:
+        - order_id
+        - user_id
+        - item_id
+        - quantity
+        - amount_cents
+        - currency
+        - lifecycle_state
+        - created_at
+      properties:
+        order_id:
+          type: string
+          example: "ord_8829f041b3a1"
+        user_id:
+          type: string
+          example: "usr_99182a4c"
+        item_id:
+          type: string
+          example: "item_flash_mbp_2026"
+        quantity:
+          type: integer
+          example: 1
+        amount_cents:
+          type: integer
+          example: 199900
+        currency:
+          type: string
+          example: "USD"
+        lifecycle_state:
+          type: string
+          description: Canonical stage in order processing lifecycle.
+          enum:
+            - CREATED
+            - PAYMENT_PENDING
+            - CONFIRMED
+            - PROCESSING
+            - SHIPPED
+            - DELIVERED
+          example: "CONFIRMED"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T12:00:15Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T12:00:18Z"
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+        - timestamp
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code.
+          example: "OUT_OF_STOCK"
+        message:
+          type: string
+          description: Human-readable error description.
+          example: "Flash sale item is sold out. Zero available inventory."
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-10-05T12:00:00Z"

@@ -1,0 +1,804 @@
+CLASS DIAGRAM
+
+classDiagram
+
+    %% =========================
+    %% INVENTORY MODULE
+    %% =========================
+
+    class InventoryManager {
+        -InventoryRepository inventoryRepo
+        -RedisClient redisClient
+        -DomainEventPublisher eventPublisher
+        -ReservationTTLService reservationTTL
+        +reserve(productId: String, userId: String, qty: int) Reservation
+        +release(reservationId: String) boolean
+        +confirm(reservationId: String) boolean
+        +getAvailableStock(productId: String) int
+    }
+
+    class InventoryRepository {
+        <<interface>>
+        +getStock(productId: String) int
+        +reserveStock(productId: String, qty: int) boolean
+        +releaseStock(productId: String, qty: int) boolean
+        +confirmStock(productId: String, qty: int) boolean
+    }
+
+    class RedisClient {
+        <<interface>>
+        +executeLua(script: String, keys: List, args: List) Object
+        +get(key: String) Object
+        +set(key: String, value: Object, ttl: int) void
+    }
+
+    class Reservation {
+        +String reservationId
+        +String productId
+        +String userId
+        +int quantity
+        +ReservationStatus status
+        +Date expiresAt
+        +reserve() void
+        +release() void
+        +confirm() void
+    }
+
+    InventoryManager --> InventoryRepository
+    InventoryManager --> RedisClient
+    InventoryManager --> Reservation
+
+
+    %% =========================
+    %% PAYMENT MODULE
+    %% =========================
+
+    class PaymentOrchestrator {
+        -PaymentStrategy paymentStrategy
+        -PaymentGateway paymentGateway
+        -IdempotencyRepository idempotencyRepo
+        -OutboxRepository outboxRepo
+        +processPayment(orderId: String, amount: Money, method: PaymentMethod) PaymentResult
+        +authorize(orderId: String, amount: Money) PaymentResult
+        +capture(paymentId: String) PaymentResult
+        +refund(paymentId: String) boolean
+        +handleCallback(event: PaymentEvent) void
+    }
+
+    class PaymentStrategy {
+        <<interface>>
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class StripeStrategy {
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class RazorpayStrategy {
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class PaymentGateway {
+        <<interface>>
+        +charge(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+        +verify(paymentId: String) PaymentStatus
+    }
+
+    class IdempotencyRepository {
+        <<interface>>
+        +exists(key: String) boolean
+        +save(key: String, response: PaymentResponse) void
+        +get(key: String) PaymentResponse
+    }
+
+    PaymentOrchestrator --> PaymentStrategy
+    PaymentOrchestrator --> PaymentGateway
+    PaymentOrchestrator --> IdempotencyRepository
+
+    PaymentStrategy <|.. StripeStrategy
+    PaymentStrategy <|.. RazorpayStrategy
+
+
+    %% =========================
+    %% ORDER MODULE
+    %% =========================
+
+    class OrderStateMachine {
+        -OrderState currentState
+        -Order order
+        -OrderRepository orderRepo
+        -DomainEventPublisher eventPublisher
+        +transition(event: OrderEvent) boolean
+        +getCurrentState() OrderState
+        +canTransition(event: OrderEvent) boolean
+        +handleEvent(event: OrderEvent) void
+    }
+
+    class OrderState {
+        <<interface>>
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class CreatedState {
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class PaymentPendingState {
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class ConfirmedState {
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class ProcessingState {
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class ShippedState {
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class DeliveredState {
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class OrderRepository {
+        <<interface>>
+        +findById(orderId: String) Order
+        +save(order: Order) void
+        +updateStatus(orderId: String, status: OrderState) void
+    }
+
+    OrderStateMachine --> OrderState
+    OrderStateMachine --> OrderRepository
+
+    OrderState <|.. CreatedState
+    OrderState <|.. PaymentPendingState
+    OrderState <|.. ConfirmedState
+    OrderState <|.. ProcessingState
+    OrderState <|.. ShippedState
+    OrderState <|.. DeliveredState
+
+
+    %% =========================
+    %% OUTBOX MODULE
+    %% =========================
+
+    class OutboxDispatcher {
+        -OutboxRepository outboxRepo
+        -MessageBroker messageBroker
+        -MessageSerializer serializer
+        -RetryPolicy retryPolicy
+        +dispatchPendingEvents() void
+        +publish(event: OutboxEvent) boolean
+        +markAsPublished(eventId: String) void
+        +markAsFailed(eventId: String, reason: String) void
+    }
+
+    class OutboxRepository {
+        <<interface>>
+        +findPendingEvents(limit: int) List~OutboxEvent~
+        +markPublished(eventId: String) void
+        +markFailed(eventId: String, reason: String) void
+    }
+
+    class MessageBroker {
+        <<interface>>
+        +publish(topic: String, message: Object) boolean
+    }
+
+    class KafkaPublisher {
+        +publish(topic: String, message: Object) boolean
+    }
+
+    class RabbitMQPublisher {
+        +publish(topic: String, message: Object) boolean
+    }
+
+    OutboxDispatcher --> OutboxRepository
+    OutboxDispatcher --> MessageBroker
+
+    MessageBroker <|.. KafkaPublisher
+    MessageBroker <|.. RabbitMQPublisher
+Complete Purchase & Reservation Flow
+
+
+sequenceDiagram
+    autonumber
+
+    actor Client
+    participant Gateway as API Gateway
+    participant Inventory as Inventory Service
+    participant Redis as Redis Cluster
+    participant Lua as Lua Reservation Script
+    participant DB as Inventory DB
+
+    Client->>Gateway: POST /inventory/reserve
+    Note over Client,Gateway: productId, quantity, userId
+
+    Gateway->>Gateway: Validate JWT
+    Gateway->>Gateway: Rate Limit Check
+
+    Gateway->>Inventory: Reserve(productId, qty, userId)
+
+    Inventory->>Redis: Execute Atomic Lua Script
+    Redis->>Lua: Check stock + reservation
+
+    Lua->>Lua: Read available stock
+
+    alt Stock Available
+        Lua->>Lua: Atomic DECR stock
+        Lua->>Lua: Create reservation
+        Lua->>Lua: Set TTL lease
+        Lua-->>Redis: SUCCESS + reservationId
+        Redis-->>Inventory: Reservation Created
+
+        Inventory->>DB: Persist Reservation
+        DB-->>Inventory: Commit
+
+        Inventory-->>Gateway: 200 Reservation Created
+        Gateway-->>Client: reservationId + expiresAt
+
+    else Insufficient Stock
+        Lua-->>Redis: FAILURE
+        Redis-->>Inventory: Out of Stock
+        Inventory-->>Gateway: 409 OUT_OF_STOCK
+        Gateway-->>Client: Product Unavailable
+    end
+Payment + Transactional Outbox Flow
+
+sequenceDiagram
+    autonumber
+
+    actor Client
+    participant Gateway as API Gateway
+    participant Payment as Payment Service
+    participant PG as Payment Gateway
+    participant DB as Order/Payment DB
+    participant Outbox as Outbox Table
+    participant Broker as Kafka / RabbitMQ
+
+    Client->>Gateway: POST /checkout
+    Gateway->>Payment: Process Payment
+
+    Payment->>Payment: Validate Idempotency Key
+
+    alt Idempotency Key Already Processed
+        Payment->>DB: Fetch Existing Payment
+        DB-->>Payment: Previous Result
+        Payment-->>Gateway: Return Previous Result
+        Gateway-->>Client: Payment Result
+
+    else New Payment
+        Payment->>PG: Charge(amount, idempotencyKey)
+
+        alt Payment Successful
+            PG-->>Payment: Payment Success
+
+            Payment->>DB: BEGIN TRANSACTION
+
+            Payment->>DB: Update Payment = SUCCESS
+            Payment->>DB: Update Order = CONFIRMED
+
+            Payment->>Outbox: INSERT PaymentSuccess Event
+
+            Note over DB,Outbox: Same DB Transaction
+
+            Payment->>DB: COMMIT
+
+            Payment-->>Gateway: Payment Successful
+            Gateway-->>Client: Order Confirmed
+
+        else Payment Failed
+            PG-->>Payment: Payment Failed
+
+            Payment->>DB: Record Payment Failure
+            Payment-->>Gateway: Payment Failed
+            Gateway-->>Client: Payment Failed
+        end
+    end
+
+    Note over Outbox,Broker: Asynchronous Publishing
+
+    loop Outbox Polling
+        Outbox->>Outbox: Find unpublished events
+        Outbox->>Broker: Publish PaymentSuccess
+        Broker-->>Outbox: ACK
+        Outbox->>Outbox: Mark event Published
+    end
+Payment Success + Order Service Crash + Recovery
+
+sequenceDiagram
+    autonumber
+
+    participant Payment as Payment Service
+    participant Order as Order Service
+    participant DB as Order DB
+    participant Outbox as Outbox Table
+    participant Dispatcher as Outbox Dispatcher
+    participant Broker as Message Broker
+
+    Payment->>Order: PaymentSuccess Event
+
+    Note over Order: Order Service receives event
+
+    Order->>DB: BEGIN TRANSACTION
+    Order->>DB: Update Order = CONFIRMED
+    Order->>Outbox: Insert OrderConfirmed Event
+
+    Note over Order: SERVICE CRASHES
+
+    Order--xDB: Connection Lost
+    Note over DB,Outbox: Transaction rolled back or committed atomically
+
+    rect rgb(255,235,235)
+        Note over Dispatcher,Outbox: Recovery Worker Starts
+    end
+
+    loop Periodic Recovery Poll
+        Dispatcher->>Outbox: SELECT unpublished events
+        Outbox-->>Dispatcher: OrderConfirmed Event
+
+        Dispatcher->>Broker: Publish OrderConfirmed
+        Broker-->>Dispatcher: ACK
+
+        Dispatcher->>Outbox: Mark Event Published
+    end
+
+    Broker->>Order: OrderConfirmed Event
+
+    Order->>Order: Idempotency Check
+
+    alt Event Already Applied
+        Order-->>Broker: ACK
+    else Event Not Applied
+        Order->>DB: Apply Event
+        Order->>DB: Commit
+        Order-->>Broker: ACK
+    end
+Inventory Reservation State Machine
+
+stateDiagram-v2
+
+    [*] --> AVAILABLE
+
+    AVAILABLE --> RESERVED: Reserve(quantity)
+
+    RESERVED --> PAYMENT_PENDING: Payment Initiated
+
+    PAYMENT_PENDING --> CONFIRMED: Payment Success
+
+    CONFIRMED --> SOLD: Order Finalized
+
+    %% Failure path
+    RESERVED --> PAYMENT_FAILED: Payment Failed
+    PAYMENT_PENDING --> PAYMENT_FAILED: Payment Failed
+
+    PAYMENT_FAILED --> RELEASED: Release Stock
+
+    %% Timeout path
+    RESERVED --> TIMEOUT: TTL Expired
+    PAYMENT_PENDING --> TIMEOUT: TTL Expired
+
+    TIMEOUT --> RELEASED: Release Stock
+
+    %% Return to stock
+    RELEASED --> AVAILABLE: Stock Restored
+
+    SOLD --> [*]
+More Rigorous Inventory State Model
+
+stateDiagram-v2
+
+    state "AVAILABLE\nStock > 0" as AVAILABLE
+    state "RESERVED\nTTL Lease Active" as RESERVED
+    state "PAYMENT_PENDING\nPayment Processing" as PAYMENT_PENDING
+    state "CONFIRMED\nPayment Successful" as CONFIRMED
+    state "SOLD\nStock Permanently Deducted" as SOLD
+    state "PAYMENT_FAILED\nPayment Rejected" as PAYMENT_FAILED
+    state "TIMEOUT\nReservation Expired" as TIMEOUT
+    state "RELEASED\nStock Returned" as RELEASED
+
+    [*] --> AVAILABLE
+
+    AVAILABLE --> RESERVED: reserve()
+
+    RESERVED --> PAYMENT_PENDING: initiatePayment()
+
+    PAYMENT_PENDING --> CONFIRMED: paymentSuccess()
+
+    CONFIRMED --> SOLD: finalizeOrder()
+
+    PAYMENT_PENDING --> PAYMENT_FAILED: paymentFailure()
+    RESERVED --> PAYMENT_FAILED: paymentFailure()
+
+    RESERVED --> TIMEOUT: TTL expires
+    PAYMENT_PENDING --> TIMEOUT: TTL expires
+
+    PAYMENT_FAILED --> RELEASED: releaseStock()
+    TIMEOUT --> RELEASED: releaseStock()
+
+    RELEASED --> AVAILABLE: restoreStock()
+
+    SOLD --> [*]
+Order Lifecycle State Machine
+
+stateDiagram-v2
+
+    [*] --> CREATED
+
+    CREATED --> PAYMENT_PENDING: initiatePayment()
+
+    PAYMENT_PENDING --> CONFIRMED: paymentSuccess()
+
+    CONFIRMED --> PROCESSING: startFulfillment()
+
+    PROCESSING --> SHIPPED: dispatchOrder()
+
+    SHIPPED --> DELIVERED: deliveryConfirmed()
+
+    %% Failure / cancellation paths
+    PAYMENT_PENDING --> CANCELLED: paymentFailed()
+    CREATED --> CANCELLED: cancelOrder()
+    CONFIRMED --> CANCELLED: cancellationAllowed()
+
+    DELIVERED --> [*]
+    CANCELLED --> [*]
+Order State Pattern — Class Relationships
+
+classDiagram
+
+    class OrderStateMachine {
+        -OrderState currentState
+        -Order order
+        +transition(event: OrderEvent)
+        +handleEvent(event: OrderEvent)
+        +getCurrentState() OrderState
+    }
+
+    class OrderState {
+        <<interface>>
+        +handle(event: OrderEvent, order: Order) OrderState
+        +canHandle(event: OrderEvent) boolean
+    }
+
+    class CreatedState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    class PaymentPendingState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    class ConfirmedState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    class ProcessingState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    class ShippedState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    class DeliveredState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    class CancelledState {
+        +handle(event, order) OrderState
+        +canHandle(event) boolean
+    }
+
+    OrderStateMachine --> OrderState
+
+    OrderState <|.. CreatedState
+    OrderState <|.. PaymentPendingState
+    OrderState <|.. ConfirmedState
+    OrderState <|.. ProcessingState
+    OrderState <|.. ShippedState
+    OrderState <|.. DeliveredState
+    OrderState <|.. CancelledState
+Payment Strategy Pattern
+
+classDiagram
+
+    class PaymentOrchestrator {
+        -PaymentStrategy strategy
+        +processPayment(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class PaymentStrategy {
+        <<interface>>
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class RazorpayStrategy {
+        -RazorpayClient client
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class StripeStrategy {
+        -StripeClient client
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    class MockPaymentStrategy {
+        +pay(request: PaymentRequest) PaymentResponse
+        +refund(paymentId: String) PaymentResponse
+    }
+
+    PaymentOrchestrator --> PaymentStrategy
+
+    PaymentStrategy <|.. RazorpayStrategy
+    PaymentStrategy <|.. StripeStrategy
+    PaymentStrategy <|.. MockPaymentStrategy
+Repository Pattern
+
+classDiagram
+
+    class InventoryRepository {
+        <<interface>>
+        +getStock(productId: String) int
+        +reserveStock(productId: String, quantity: int) boolean
+        +releaseStock(productId: String, quantity: int) boolean
+    }
+
+    class PostgresInventoryRepository {
+        -DatabaseConnection db
+        +getStock(productId: String) int
+        +reserveStock(productId: String, quantity: int) boolean
+        +releaseStock(productId: String, quantity: int) boolean
+    }
+
+    class RedisInventoryRepository {
+        -RedisClient redis
+        +getStock(productId: String) int
+        +reserveStock(productId: String, quantity: int) boolean
+        +releaseStock(productId: String, quantity: int) boolean
+    }
+
+    class InventoryManager {
+        -InventoryRepository repository
+        +reserve()
+        +release()
+        +confirm()
+    }
+
+    InventoryManager --> InventoryRepository
+
+    InventoryRepository <|.. PostgresInventoryRepository
+    InventoryRepository <|.. RedisInventoryRepository
+Facade + Circuit Breaker
+
+classDiagram
+
+    class PaymentOrchestrator {
+        -PaymentFacade facade
+        -CircuitBreaker circuitBreaker
+        +processPayment(request) PaymentResponse
+        +refund(paymentId) PaymentResponse
+    }
+
+    class PaymentFacade {
+        +charge(request) PaymentResponse
+        +refund(paymentId) PaymentResponse
+        +verify(paymentId) PaymentStatus
+    }
+
+    class CircuitBreaker {
+        -CircuitState state
+        -int failureCount
+        -int failureThreshold
+        +execute(operation) PaymentResponse
+        +recordSuccess()
+        +recordFailure()
+        +open()
+        +close()
+    }
+
+    class PaymentGateway {
+        <<interface>>
+        +charge(request) PaymentResponse
+        +refund(paymentId) PaymentResponse
+    }
+
+    class RazorpayGateway {
+        +charge(request) PaymentResponse
+        +refund(paymentId) PaymentResponse
+    }
+
+    class StripeGateway {
+        +charge(request) PaymentResponse
+        +refund(paymentId) PaymentResponse
+    }
+
+    PaymentOrchestrator --> PaymentFacade
+    PaymentOrchestrator --> CircuitBreaker
+
+    PaymentFacade --> PaymentGateway
+
+    PaymentGateway <|.. RazorpayGateway
+    PaymentGateway <|.. StripeGateway
+Circuit Breaker State Machine
+
+stateDiagram-v2
+
+    [*] --> CLOSED
+
+    CLOSED --> OPEN: Failure threshold exceeded
+
+    OPEN --> HALF_OPEN: Recovery timeout
+
+    HALF_OPEN --> CLOSED: Test request succeeds
+
+    HALF_OPEN --> OPEN: Test request fails
+
+    CLOSED --> CLOSED: Successful request
+Transactional Outbox Architecture
+
+flowchart LR
+
+    API["Checkout API"]
+
+    PAYMENT["Payment Service"]
+
+    DB[("Primary DB")]
+
+    OUTBOX[("Transactional Outbox")]
+
+    DISPATCHER["Outbox Dispatcher"]
+
+    BROKER{"Kafka / RabbitMQ"}
+
+    CONSUMER["Order / Notification Consumers"]
+
+    API --> PAYMENT
+
+    PAYMENT --> DB
+    PAYMENT --> OUTBOX
+
+    DB -.->|"Same DB Transaction"| OUTBOX
+
+    OUTBOX --> DISPATCHER
+
+    DISPATCHER --> BROKER
+
+    BROKER --> CONSUMER
+
+    style DB fill:#e8e0ff,stroke:#7048b8,stroke-width:2px
+    style OUTBOX fill:#fff2cc,stroke:#d99a00,stroke-width:3px
+    style BROKER fill:#dff5e3,stroke:#24943c,stroke-width:2px
+    style DISPATCHER fill:#e8f1ff,stroke:#2878d4,stroke-width:2px
+SOLID Principles Mapping
+
+flowchart TB
+
+    SOLID["SALESTORM SOLID DESIGN"]
+
+    SRP["SRP — Single Responsibility"]
+    OCP["OCP — Open / Closed"]
+    LSP["LSP — Liskov Substitution"]
+    ISP["ISP — Interface Segregation"]
+    DIP["DIP — Dependency Inversion"]
+
+    SOLID --> SRP
+    SOLID --> OCP
+    SOLID --> LSP
+    SOLID --> ISP
+    SOLID --> DIP
+
+    SRP --> I1["InventoryManager → Inventory"]
+    SRP --> I2["PaymentOrchestrator → Payments"]
+    SRP --> I3["OrderStateMachine → State Transitions"]
+    SRP --> I4["OutboxDispatcher → Event Publishing"]
+
+    OCP --> O1["PaymentStrategy"]
+    OCP --> O2["PricingStrategy"]
+    OCP --> O3["New Order States"]
+
+    LSP --> L1["StripeStrategy"]
+    LSP --> L2["RazorpayStrategy"]
+    LSP --> L3["Both implement PaymentStrategy"]
+
+    ISP --> P1["PaymentGateway"]
+    ISP --> P2["InventoryRepository"]
+    ISP --> P3["MessageBroker"]
+
+    DIP --> D1["High-level services"]
+    DIP --> D2["Depend on interfaces"]
+    DIP --> D3["Implementations injected via DI"]
+
+    style SOLID fill:#1f4e79,color:#fff,stroke:#163a5c
+    style SRP fill:#dff5e3,stroke:#24943c
+    style OCP fill:#dff5e3,stroke:#24943c
+    style LSP fill:#dff5e3,stroke:#24943c
+    style ISP fill:#dff5e3,stroke:#24943c
+    style DIP fill:#dff5e3,stroke:#24943c
+Design Patterns Mapping
+
+flowchart TB
+
+    ROOT["SALESTORM DESIGN PATTERNS"]
+
+    STRATEGY["Strategy Pattern"]
+    STATE["State Pattern"]
+    REPO["Repository Pattern"]
+    FACADE["Facade Pattern"]
+    CB["Circuit Breaker"]
+    OUTBOX["Transactional Outbox"]
+    RETRY["Retry + Backoff"]
+    RATE["Rate Limiting"]
+    IDEMP["Idempotency"]
+
+    ROOT --> STRATEGY
+    ROOT --> STATE
+    ROOT --> REPO
+    ROOT --> FACADE
+    ROOT --> CB
+    ROOT --> OUTBOX
+    ROOT --> RETRY
+    ROOT --> RATE
+    ROOT --> IDEMP
+
+    STRATEGY --> S1["Payment Providers"]
+    STRATEGY --> S2["Pricing Rules"]
+
+    STATE --> ST1["Order Lifecycle"]
+    STATE --> ST2["Reservation Lifecycle"]
+
+    REPO --> R1["InventoryRepository"]
+    REPO --> R2["OrderRepository"]
+    REPO --> R3["PaymentRepository"]
+
+    FACADE --> F1["PaymentOrchestrator"]
+    FACADE --> F2["Checkout Orchestration"]
+
+    CB --> C1["External Payment Gateway"]
+    CB --> C2["Failure Isolation"]
+
+    OUTBOX --> O1["Reliable Event Publishing"]
+    OUTBOX --> O2["Crash Recovery"]
+
+    RETRY --> RT1["Transient API Failures"]
+    RETRY --> RT2["Broker Failures"]
+
+    RATE --> RL1["5 req/s per IP"]
+    RATE --> RL2["DDoS / Abuse Protection"]
+
+    IDEMP --> ID1["Duplicate Payments"]
+    IDEMP --> ID2["Duplicate Events"]
+
+    style ROOT fill:#1f4e79,color:#fff
+    style STRATEGY fill:#e8e0ff,stroke:#7048b8
+    style STATE fill:#e8e0ff,stroke:#7048b8
+    style REPO fill:#e8e0ff,stroke:#7048b8
+    style FACADE fill:#e8e0ff,stroke:#7048b8
+    style CB fill:#ffe0e0,stroke:#d62828
+    style OUTBOX fill:#fff2cc,stroke:#d99a00
+    style RETRY fill:#fff2cc,stroke:#d99a00
+    style RATE fill:#e8f1ff,stroke:#2878d4
+    style IDEMP fill:#e8f1ff,stroke:#2878d4
